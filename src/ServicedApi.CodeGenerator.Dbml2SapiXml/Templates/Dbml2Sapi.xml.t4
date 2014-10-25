@@ -1,0 +1,337 @@
+﻿<#@ template language="C#" hostspecific="true" debug="true" #>
+<#@ assembly name="System.Core" #>
+<#@ assembly name="System.Xml" #>
+<#@ assembly name="System.Xml.Linq" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Xml" #>
+<#@ import namespace="System.Xml.Linq" #>
+
+<#
+string apiNamespace = Host.ResolveParameterValue( null, null, "ApiNamespace" );
+string dbmlFileName = Host.ResolveParameterValue( null, null, "DbmlFileName" );
+
+XDocument dbml = XDocument.Load( dbmlFileName );
+XNamespace ns = "http://schemas.microsoft.com/linqtosql/dbml/2007";
+
+IEnumerable<XElement> tableTypes = dbml.Root.Elements( ns + "Table" ).Elements( ns + "Type" );
+
+List<XElement> factypeTypes = (
+                            from tableType in tableTypes
+                            where
+                                tableType.Attribute( "Name" ).Value.EndsWith( "Type" ) == true
+                                || tableType.Attribute( "Name" ).Value.EndsWith( "Enum" ) == true
+                            select tableType 
+                            ).ToList() ;
+
+List<string> factypeNames = factypeTypes.Attributes( "Name" ).Select( attribute => attribute.Value ).ToList();
+							
+List<XElement> serviceTypes = (
+                            from tableType in tableTypes
+                            where
+                                tableType.Attribute( "Name" ).Value.EndsWith( "Type" ) != true
+                                && tableType.Attribute( "Name" ).Value.EndsWith( "Enum" ) != true
+                            select tableType 
+                            ).ToList();
+
+List<string> serviceNames = serviceTypes.Attributes( "Name" ).Select( attribute => attribute.Value ).ToList();
+
+#>
+<?xml version="1.0" encoding="utf-8" ?>
+<ServicedApi Namespace="<#= apiNamespace#>">
+    <Services>
+<#
+foreach( XElement serviceType in serviceTypes )
+{
+	string name = serviceType.Attribute( "Name" ).Value;
+#>
+        <Service Name="<#=name#>">
+            <Properties>
+<#
+    List<XElement> columns = serviceType.Elements( ns + "Column" ).ToList();
+
+    foreach( XElement column in columns )
+    {
+        string columnName = column.Attribute( "Name" ).Value;
+        string columnType = column.Attribute( "Type" ).Value;
+        bool canBeNull = column.Attribute( "CanBeNull" ) != null
+            ? bool.Parse( column.Attribute( "CanBeNull" ).Value ) : false;
+        bool isPrimaryKey = column.Attribute( "IsPrimaryKey" ) != null 
+            ? bool.Parse( column.Attribute( "IsPrimaryKey" ).Value ) : false;
+		bool isVersion = false;
+		
+		if( columnType == "System.Data.Linq.Binary" )
+		{
+			columnType = "System.Byte[]";
+			isVersion = true;
+		}
+		
+		// HACK: This should really check to see if the Type is a primitive (and therefore can be wrapped with Nullable).  JF
+        if( canBeNull && columnType != "System.String" && columnType != "System.Xml.Linq.XElement" )
+        {
+            columnType = String.Format( "System.Nullable&lt;{0}&gt;", columnType );
+        }
+		
+		string isIdentifierAttribute = string.Empty;
+		if( isPrimaryKey )
+		{
+			isIdentifierAttribute = " IsIdentifier=\"true\"";
+		}
+		
+		string isVersionAttribute = string.Empty;
+		if( isVersion )
+		{
+			isVersionAttribute = " IsVersion=\"true\"";
+		}		
+#>
+                <Attribute Name="<#=columnName#>" Type="<#=columnType#>"<#=isIdentifierAttribute#><#=isVersionAttribute#>/> 
+<#
+	}
+
+	List<XElement> associations = serviceType.Elements( ns + "Association" ).ToList();
+
+    foreach( XElement association in associations )
+    {
+        bool isForeignKey = association.Attribute( "IsForeignKey" ) != null
+            ? bool.Parse( association.Attribute( "IsForeignKey" ).Value ) : false;
+		string memberName = association.Attribute( "Member" ).Value;
+		string thisKey = association.Attribute( "ThisKey" ).Value;
+		string referencedType = association.Attribute( "Type" ).Value;
+
+        XElement keyColumn = (
+                from kc in serviceType.Elements( ns + "Column" )
+                where kc.Attribute( "Name" ).Value == thisKey
+                select kc
+                ).First();
+        string keyType = keyColumn.Attribute( "Type" ).Value;
+
+		if( isForeignKey ) //&& factypeNames.Contains( referencedType ) )
+		{
+			// NOTE: If isForeignKey then we're talking about a MANY:1, that is, this entity is the child.
+			string parentKey = association.Attribute( "OtherKey" ).Value;
+			string childKey = association.Attribute( "ThisKey" ).Value;
+#>
+                <ParentReference Name="<#=memberName#>" ChildKey="<#=childKey#>" ParentType="<#=referencedType#>" ParentKey="<#=parentKey#>"/>
+<#
+		}
+		else if( !factypeNames.Contains( referencedType ) )
+		{
+			// NOTE: If NOT IsForeignKey then it's 1:MANY.  This entity is the parent.
+			// NOTE: A ServiceObject will NEVER have a ChildReference to a Factype (THINK ABOUT IT) so we 
+			// don't even need to consider this scenario.  JF
+			string parentKey = association.Attribute( "ThisKey" ).Value;
+			string childKey = association.Attribute( "OtherKey" ).Value;
+#>
+                <ChildReference Name="<#=memberName#>" ParentKey="<#=parentKey#>" ChildType="<#=referencedType#>" ChildKey="<#=childKey#>"/>
+<#			
+		}	
+	}
+#>
+            </Properties>
+            <Operations>
+                <Create Visibility="Public" />
+                <Read Visibility="Public" />
+                <Update Visibility="Public" />
+                <!-- Delete Visibility="Public" / -->
+<#
+    foreach( XElement association in associations )
+    {
+        bool isForeignKey = association.Attribute( "IsForeignKey" ) != null
+            ? bool.Parse( association.Attribute( "IsForeignKey" ).Value ) : false;
+		string memberName = association.Attribute( "Member" ).Value;
+		string thisKey = association.Attribute( "ThisKey" ).Value;
+		string referencedType = association.Attribute( "Type" ).Value;
+
+        XElement keyColumn = (
+                from kc in serviceType.Elements( ns + "Column" )
+                where kc.Attribute( "Name" ).Value == thisKey
+                select kc
+                ).First();
+        string keyType = keyColumn.Attribute( "Type" ).Value;
+
+		if( isForeignKey )
+		{
+			// NOTE: If isForeignKey then we're talking about a MANY:1, that is, this entity is the child.
+			string parentKey = association.Attribute( "OtherKey" ).Value;
+			string childKey = association.Attribute( "ThisKey" ).Value;
+#>
+                    <ReadByParent Visibility="Public" Name="ReadBy<#=memberName#>" ParentType="<#=referencedType#>" ChildKey="<#=childKey#>" ParentKey="<#=parentKey#>" />
+<#
+			if( !factypeNames.Contains( referencedType ) )
+			{
+				// NOTE: No ReadParent on Factypes.  It doesn't make any sense.  Also, you can easily 
+				//	just cast the moniker or key to the Factype type.  JF
+#>
+                    <ReadParent Visibility="Public" Name="Read<#=memberName#>" ParentType="<#=referencedType#>" ChildKey="<#=childKey#>" ParentKey="<#=parentKey#>" />
+<#
+			}
+		}else{
+			// NOTE: This case is 1:MANY, the entity is the parent.
+			// NOTE: We don't need to worry about ReadChildren pointing to a Factype as the 
+			//	child object.  Think about it.  It just doesn't make any sense for a factype
+			//	to point to a ServiceObject as it's parent.  JF
+			string childKey = association.Attribute( "OtherKey" ).Value;
+			string parentKey = association.Attribute( "ThisKey" ).Value;
+			string childOperation = "ReadBy" + name;
+#>
+                <ReadChildren Visibility="Public" Name="Read<#=memberName#>" ChildType="<#=referencedType#>" ChildKey="<#=childKey#>" ParentKey="<#=parentKey#>" ChildOperation="<#=childOperation#>"/>
+<#
+		}
+	}
+#>
+            </Operations>
+        </Service>
+<#
+}
+#>
+    </Services>
+    <Factypes>
+<#
+foreach( XElement factypeType in factypeTypes )
+{
+	string name = factypeType.Attribute( "Name" ).Value;
+	
+	List<XElement> columns = factypeType.Elements( ns + "Column" ).ToList();
+
+	// NOTE: Need to find the moniker name and determine if this is a keyed factype.  JF
+	// TODO: Probably a much more elegant "linq-y" way to do this.  JF
+	string monikerName = "Moniker";
+    foreach( XElement column in columns )
+    {
+        string columnName = column.Attribute( "Name" ).Value;
+        string columnType = column.Attribute( "Type" ).Value;
+        bool isPrimaryKey = column.Attribute( "IsPrimaryKey" ) != null 
+            ? bool.Parse( column.Attribute( "IsPrimaryKey" ).Value ) : false;
+		
+
+		if( isPrimaryKey && ( columnType == "string" || columnType == "String" || columnType == "System.String" ) )
+		{
+			monikerName = columnName;
+			break;
+		}
+	}
+#>
+        <Factype Name="<#=name#>" MonikerName="<#=monikerName#>" >
+            <Properties>
+<#
+    foreach( XElement column in columns )
+    {
+        string columnName = column.Attribute( "Name" ).Value;
+        string columnType = column.Attribute( "Type" ).Value;
+        bool canBeNull = column.Attribute( "CanBeNull" ) != null
+            ? bool.Parse( column.Attribute( "CanBeNull" ).Value ) : false;
+        bool isPrimaryKey = column.Attribute( "IsPrimaryKey" ) != null 
+            ? bool.Parse( column.Attribute( "IsPrimaryKey" ).Value ) : false;
+
+        if( canBeNull && columnType != "System.String" )
+        {
+            columnType = String.Format( "System.Nullable&lt;{0}&gt;", columnType );
+        }
+		
+		// TODO: Clean this up if possible.  See in-line notes and to-dos below.  JF
+		if( isPrimaryKey && ( columnType == "string" || columnType == "String" || columnType == "System.String" ) )
+		{
+			// NOTE: Moniker for regular (unkeyed) Factype.  Moniker is never in the list of properties because the constant name *is* the Moniker value.  JF
+		}else if( columnName == monikerName )
+		{
+			// NOTE: Moniker for KeyedFactype.  If you trace the logic backwards from here you'll find that you *must* call the moniker column "Moniker"
+			//	or it's going to be spit out as a property (remember the Moniker never gets a property on the Factype because it's the constant name.  JF
+			// TODO: Rethink how this is handled.  Is there some elegant way to allow for the Moniker column in the DB to be called something else but
+			//	still be seen by this generator code as the Moniker?  I don't think so.  JF
+		}else if( isPrimaryKey ){
+			// NOTE: Keyed Factype.  JF
+#>
+                <Attribute Name="<#=columnName#>" Type="<#=columnType#>" IsKey="true" />
+<#
+		}else{
+#>
+                <Attribute Name="<#=columnName#>" Type="<#=columnType#>"  />
+<#
+		}
+	}
+	
+	List<XElement> associations = factypeType.Elements( ns + "Association" ).ToList();
+
+    foreach( XElement association in associations )
+    {
+        bool isForeignKey = association.Attribute( "IsForeignKey" ) != null
+            ? bool.Parse( association.Attribute( "IsForeignKey" ).Value ) : false;
+		string memberName = association.Attribute( "Member" ).Value;
+		string thisKey = association.Attribute( "ThisKey" ).Value;
+		string referencedType = association.Attribute( "Type" ).Value;
+
+        XElement keyColumn = (
+                from kc in factypeType.Elements( ns + "Column" )
+                where kc.Attribute( "Name" ).Value == thisKey
+                select kc
+                ).First();
+        string keyType = keyColumn.Attribute( "Type" ).Value;
+
+		if( isForeignKey && factypeNames.Contains( referencedType ) )
+		{
+			// NOTE: If isForeignKey then we're talking about a MANY:1, that is, this entity is the child.
+			// NOTE: A Factype will never have a ParentReference to a ServiceObject.  This would make no sense.  JF
+			string parentKey = association.Attribute( "OtherKey" ).Value;
+			string childKey = association.Attribute( "ThisKey" ).Value;
+#>
+                <ParentReference Name="<#=memberName#>" ChildKey="<#=childKey#>" ParentType="<#=referencedType#>" ParentKey="<#=parentKey#>"/>
+<#
+		}
+		else
+		{
+			string childKey = association.Attribute( "OtherKey" ).Value;
+			string parentKey = association.Attribute( "ThisKey" ).Value;
+#>
+                <ChildReference Name="<#=memberName#>" ParentKey="<#=parentKey#>" ChildType="<#=referencedType#>" ChildKey="<#=childKey#>"/>
+<#		
+		}
+	}
+#>
+            </Properties>  
+            <Operations>
+<#
+    foreach( XElement association in associations )
+    {
+        bool isForeignKey = association.Attribute( "IsForeignKey" ) != null
+            ? bool.Parse( association.Attribute( "IsForeignKey" ).Value ) : false;
+		string memberName = association.Attribute( "Member" ).Value;
+		string thisKey = association.Attribute( "ThisKey" ).Value;
+		string referencedType = association.Attribute( "Type" ).Value;
+		
+        XElement keyColumn = (
+                from kc in factypeType.Elements( ns + "Column" )
+                where kc.Attribute( "Name" ).Value == thisKey
+                select kc
+                ).First();
+		
+        string keyType = keyColumn.Attribute( "Type" ).Value;
+		
+		if( isForeignKey && factypeNames.Contains( referencedType ) )
+		{
+			// NOTE: If isForeignKey then we're talking about a MANY:1, that is, this entity is the child.
+			// NOTE: The only operations we're currently supporting on Factypes are GetByParent.  Nothing
+			//	else really makes any sense.  Factype -> ServiceObject will always be a Parent->Child and
+			//	all we really need is the .ReadByParent() on the service object (which we should get).  For
+			//	Factype->Factype you have the .ChildReference and .ParentReference properties, and this
+			//	.GetByParent() pattern, but as a total convenience.  JF
+			string parentKey = association.Attribute( "OtherKey" ).Value;
+			string childKey = association.Attribute( "ThisKey" ).Value;
+#>
+                    <GetByParent Visibility="Public" Name="GetBy<#=memberName#>" ParentType="<#=referencedType#>" ChildKey="<#=childKey#>" />
+<#
+		}
+	}
+#>
+            </Operations>			
+        </Factype>
+<#
+}
+#>
+    </Factypes>
+    <ViewLists>
+    </ViewLists>
+    <Pocos>
+    </Pocos>
+</ServicedApi>
